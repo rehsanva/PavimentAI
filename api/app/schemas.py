@@ -106,3 +106,23 @@ class OcorrenciaOut(BaseModel):
     criado_em: datetime
     verificada_em: datetime | None
     id_ocorrencia_principal: int | None
+
+
+class FotoOut(BaseModel):
+    id_midia: int
+    url: str  # caminho para baixar a imagem, ex.: /midias/7
+    finalidade: str
+    largura_pixels: int | None
+    altura_pixels: int | None
+    enviada_em: datetime
+
+
+# -------------------------------------------------------------------- fotos
+class FotoOut(BaseModel):
+    id_midia: int
+    url: str  # caminho para baixar a imagem (ex.: /midias/7/arquivo)
+    origem: str
+    finalidade: str
+    largura_pixels: int | None
+    altura_pixels: int | None
+    enviada_em: datetime

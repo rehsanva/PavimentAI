@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 
 from .db import get_conn, pool
-from .routers import auth, ocorrencias
+from .routers import auth, fotos, ocorrencias
 
 
 @asynccontextmanager
@@ -13,9 +13,10 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 
-app = FastAPI(title="PavimentAI API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="PavimentAI API", version="0.4.0", lifespan=lifespan)
 app.include_router(auth.router)
 app.include_router(ocorrencias.router)
+app.include_router(fotos.router)
 
 
 @app.get("/saude")
