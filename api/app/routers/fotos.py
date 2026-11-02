@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from .. import auditoria
 from ..config import settings
 from ..db import get_conn
-from ..deps import usuario_atual
+from ..deps import exigir_gestao_da_area, usuario_atual
 from ..imagens import MAX_BYTES, ImagemInvalida, processar
 from ..schemas import FotoOut
 
@@ -58,7 +58,7 @@ def enviar_foto(
     e com uma foto que não tenha sido usada antes. Gestor e admin: em qualquer uma."""
     o = conn.execute(
         """
-        SELECT id_usuario_criador, status,
+        SELECT id_usuario_criador, status, id_area,
                (now() - criado_em) > make_interval(mins => %s) AS fora_do_prazo
         FROM ocorrencias WHERE id_ocorrencia = %s
         """,
@@ -68,6 +68,8 @@ def enviar_foto(
         raise HTTPException(404, "Ocorrência não encontrada")
 
     eh_gestao = u["papel"] in ("gestor", "admin")
+    if eh_gestao:
+        exigir_gestao_da_area(u, o["id_area"])  # gestor só mexe no próprio município
     if not eh_gestao:
         if o["id_usuario_criador"] != u["id_usuario"] or o["status"] != "aberta":
             raise HTTPException(403, "Você só pode enviar fotos nas suas próprias ocorrências abertas")

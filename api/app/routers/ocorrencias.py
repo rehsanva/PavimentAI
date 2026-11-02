@@ -16,10 +16,60 @@ COLUNAS = """
     id_ocorrencia, tipo, categoria, descricao,
     COALESCE(gravidade_verificada, gravidade_cidadao) AS gravidade,
     latitude, longitude, status, canal_registro,
-    criado_em, verificada_em, id_ocorrencia_principal
+    criado_em, verificada_em, id_ocorrencia_principal, id_area
 """
 
 MAX_GRAUS_MAPA = 10  # tamanho máximo da área pedida no mapa (em graus)
+
+
+def _checar_area_de_atendimento(conn, lat: float, lon: float) -> tuple[int | None, bool]:
+    """Cerca geográfica: só aceita ocorrência dentro de uma área de atendimento ativa
+    (com uma folguinha na divisa por causa do erro do GPS).
+    Devolve (id da área onde o ponto caiu, se essa área exige morador).
+    Se não houver nenhuma área cadastrada, não restringe nada (devolve None, False)."""
+    r = conn.execute(
+        """
+        WITH p AS (
+            SELECT ST_SetSRID(ST_MakePoint(%(lon)s::float8, %(lat)s::float8), 4326)::geography AS geo
+        ),
+        achada AS (
+            SELECT a.id_area, a.exige_residencia FROM areas_atendimento a, p
+            WHERE a.ativa AND ST_DWithin(a.geometria, p.geo, %(tol)s::float8)
+            ORDER BY ST_Distance(a.geometria, p.geo) LIMIT 1
+        )
+        SELECT (SELECT count(*) FROM areas_atendimento WHERE ativa) AS total,
+               (SELECT string_agg(nome, ', ' ORDER BY nome) FROM areas_atendimento WHERE ativa) AS nomes,
+               (SELECT id_area FROM achada) AS id_area,
+               coalesce((SELECT exige_residencia FROM achada), false) AS exige_residencia
+        """,
+        {"lat": lat, "lon": lon, "tol": settings.tolerancia_area_m},
+    ).fetchone()
+    if r["total"] > 0 and r["id_area"] is None:
+        raise HTTPException(
+            422,
+            f"Este local está fora da área de atendimento ({r['nomes']}). "
+            "Só é possível registrar ocorrências dentro dela.",
+        )
+    return r["id_area"], r["exige_residencia"]
+
+
+def _checar_quem_pode_registrar(u, id_area: int | None, exige_residencia: bool) -> None:
+    """Regras por perfil, sempre considerando o município onde o buraco está."""
+    if u["papel"] == "admin":
+        return
+    if u["papel"] == "gestor":
+        if id_area is None or u["id_area_gestao"] != id_area:
+            raise HTTPException(403, {"codigo": "outro_municipio",
+                                      "mensagem": "Você administra outro município."})
+        return
+    # Cidadão: precisa ter informado onde mora ...
+    if not u["residencia_informada"]:
+        raise HTTPException(403, {"codigo": "residencia_pendente",
+                                  "mensagem": "Informe o seu CEP (PUT /auth/residencia) antes de registrar ocorrências."})
+    # ... e, nos municípios que exigem morador, a residência tem que ser a mesma da ocorrência
+    if exige_residencia and u["id_area_residencia"] != id_area:
+        raise HTTPException(403, {"codigo": "fora_da_residencia",
+                                  "mensagem": "Neste município só moradores podem registrar ocorrências."})
 
 
 @router.post("", response_model=OcorrenciaOut, status_code=201)
@@ -36,7 +86,11 @@ def criar(dados: OcorrenciaIn, u=Depends(usuario_atual), conn=Depends(get_conn))
     if n >= settings.limite_ocorrencias_hora:
         raise HTTPException(429, "Limite de registros por hora atingido. Tente mais tarde.")
 
-    # 2) Duplicidade: mesma coisa (tipo e categoria), aberta, num raio de poucos metros
+    # 2) Cerca geográfica: o local precisa estar numa área de atendimento
+    id_area, exige_residencia = _checar_area_de_atendimento(conn, dados.latitude, dados.longitude)
+    _checar_quem_pode_registrar(u, id_area, exige_residencia)
+
+    # 3) Duplicidade: mesma coisa (tipo e categoria), aberta, num raio de poucos metros
     if not dados.criar_mesmo_assim:
         proximas = conn.execute(
             """
@@ -48,6 +102,7 @@ def criar(dados: OcorrenciaIn, u=Depends(usuario_atual), conn=Depends(get_conn))
             FROM ocorrencias o, p
             WHERE o.status = 'aberta'
               AND o.tipo = %(tipo)s
+              AND o.id_area IS NOT DISTINCT FROM %(id_area)s::int
               AND o.categoria IS NOT DISTINCT FROM %(categoria)s::text
               AND ST_DWithin(o.localizacao, p.geo, %(raio)s::float8)
             ORDER BY distancia_m
@@ -57,6 +112,7 @@ def criar(dados: OcorrenciaIn, u=Depends(usuario_atual), conn=Depends(get_conn))
                 "lat": dados.latitude,
                 "lon": dados.longitude,
                 "tipo": dados.tipo,
+                "id_area": id_area,
                 "categoria": dados.categoria,
                 "raio": settings.raio_duplicidade_m,
             },
@@ -79,19 +135,19 @@ def criar(dados: OcorrenciaIn, u=Depends(usuario_atual), conn=Depends(get_conn))
                 },
             )
 
-    # 3) Grava a ocorrência, o primeiro item do histórico e a auditoria
+    # 4) Grava a ocorrência, o primeiro item do histórico e a auditoria
     #    (tudo na mesma transação: ou grava tudo ou nada)
     canal = "app_cidadao" if u["papel"] == "cidadao" else "painel_gestao"
     o = conn.execute(
         f"""
         INSERT INTO ocorrencias
             (tipo, categoria, descricao, gravidade_cidadao,
-             latitude, longitude, canal_registro, id_usuario_criador)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+             latitude, longitude, canal_registro, id_usuario_criador, id_area)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING {COLUNAS}
         """,
         (dados.tipo, dados.categoria, dados.descricao, dados.gravidade,
-         dados.latitude, dados.longitude, canal, u["id_usuario"]),
+         dados.latitude, dados.longitude, canal, u["id_usuario"], id_area),
     ).fetchone()
 
     conn.execute(
@@ -116,6 +172,7 @@ def mapa(
     lon_min: Annotated[float, Query(ge=-180, le=180)],
     lon_max: Annotated[float, Query(ge=-180, le=180)],
     tipo: Literal["buraco", "acessibilidade"] | None = None,
+    id_area: Annotated[int | None, Query(ge=1, description="Só ocorrências desta cidade/área")] = None,
     limite: Annotated[int, Query(ge=1, le=2000)] = 500,
     conn=Depends(get_conn),
 ):
@@ -128,18 +185,19 @@ def mapa(
     linhas = conn.execute(
         """
         SELECT id_ocorrencia, tipo, categoria, gravidade, status, canal_registro,
-               confianca_max, criado_em, latitude, longitude
+               confianca_max, criado_em, latitude, longitude, id_area
         FROM vw_mapa_ocorrencias
         WHERE ST_Intersects(
                   localizacao,
                   ST_MakeEnvelope(%(lon_min)s::float8, %(lat_min)s::float8,
                                   %(lon_max)s::float8, %(lat_max)s::float8, 4326)::geography)
           AND (%(tipo)s::text IS NULL OR tipo = %(tipo)s::text)
+          AND (%(id_area)s::int IS NULL OR id_area = %(id_area)s::int)
         ORDER BY criado_em DESC
         LIMIT %(limite)s
         """,
         {"lat_min": lat_min, "lat_max": lat_max, "lon_min": lon_min,
-         "lon_max": lon_max, "tipo": tipo, "limite": limite},
+         "lon_max": lon_max, "tipo": tipo, "id_area": id_area, "limite": limite},
     ).fetchall()
 
     return {
@@ -151,6 +209,7 @@ def mapa(
                 "geometry": {"type": "Point", "coordinates": [r["longitude"], r["latitude"]]},
                 "properties": {
                     "id_ocorrencia": r["id_ocorrencia"],
+                    "id_area": r["id_area"],
                     "tipo": r["tipo"],
                     "categoria": r["categoria"],
                     "gravidade": r["gravidade"],

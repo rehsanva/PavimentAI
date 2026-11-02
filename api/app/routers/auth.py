@@ -4,11 +4,11 @@ import psycopg.errors
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
 
-from .. import auditoria
+from .. import auditoria, residencia
 from ..config import settings
 from ..db import get_conn
-from ..deps import usuario_atual
-from ..schemas import CadastroIn, ReenviarIn, TokenOut, UsuarioOut, VerificarEmailIn
+from ..deps import COLUNAS_USUARIO, usuario_atual
+from ..schemas import CadastroIn, ReenviarIn, ResidenciaIn, TokenOut, UsuarioOut, VerificarEmailIn
 from ..seguranca import (
     criar_token,
     gerar_codigo_6_digitos,
@@ -41,21 +41,35 @@ def _criar_codigo_email(conn, id_usuario: int, email: str) -> None:
 
 @router.post("/cadastro", status_code=201)
 def cadastro(dados: CadastroIn, conn=Depends(get_conn)):
+    # Primeiro descobre a cidade pelo CEP: se o CEP não existir, nem cria a conta
+    res = residencia.resolver(conn, dados.cep)
     try:
         u = conn.execute(
             """
-            INSERT INTO usuarios (nome, email, telefone, hash_senha)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO usuarios
+                (nome, email, telefone, hash_senha, cep, codigo_ibge_residencia,
+                 municipio_residencia, uf_residencia, id_area_residencia, residencia_atualizada_em)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             RETURNING id_usuario, email
             """,
-            (dados.nome, dados.email, dados.telefone, gerar_hash_senha(dados.senha)),
+            (dados.nome, dados.email, dados.telefone, gerar_hash_senha(dados.senha),
+             res["cep"], res["codigo_ibge"], res["municipio"], res["uf"], res["id_area"]),
         ).fetchone()
     except psycopg.errors.UniqueViolation:
         raise HTTPException(409, "E-mail ou telefone já cadastrado")
 
     auditoria.registrar(conn, "cadastro", u["id_usuario"], "usuarios", u["id_usuario"])
     _criar_codigo_email(conn, u["id_usuario"], u["email"])
-    return {"mensagem": "Conta criada. Confirme seu e-mail com o código enviado."}
+    resposta = {
+        "mensagem": "Conta criada. Confirme seu e-mail com o código enviado.",
+        "municipio": res["municipio"],
+        "uf": res["uf"],
+        "cidade_atendida": res["atendido"],
+    }
+    if not res["atendido"]:
+        resposta["aviso"] = (f"{res['municipio']}/{res['uf']} ainda não é atendida pelo PavimentAI. "
+                             "Você já pode criar a conta e acompanhar o mapa.")
+    return resposta
 
 
 @router.post("/verificar-email")
@@ -160,6 +174,42 @@ def login(form: OAuth2PasswordRequestForm = Depends(), conn=Depends(get_conn)):
 
     auditoria.registrar(conn, "login", u["id_usuario"], "usuarios", u["id_usuario"])
     return TokenOut(access_token=criar_token(u["id_usuario"]))
+
+
+@router.put("/residencia", response_model=UsuarioOut)
+def atualizar_residencia(dados: ResidenciaIn, u=Depends(usuario_atual), conn=Depends(get_conn)):
+    """Informa (ou troca) o CEP de residência. Serve também para quem se cadastrou antes
+    desta regra existir. Para ninguém pular de cidade só para registrar em outra,
+    a troca só é permitida de tempos em tempos."""
+    if u["papel"] != "cidadao":
+        raise HTTPException(403, "Só cidadãos informam residência.")
+
+    atual = conn.execute(
+        """
+        SELECT cep, (residencia_atualizada_em > now() - make_interval(days => %s)) AS recente
+        FROM usuarios WHERE id_usuario = %s
+        """,
+        (settings.dias_troca_residencia, u["id_usuario"]),
+    ).fetchone()
+    if atual["cep"] is not None and atual["recente"]:
+        raise HTTPException(
+            429, f"Você só pode trocar a cidade de residência a cada {settings.dias_troca_residencia} dias.")
+
+    res = residencia.resolver(conn, dados.cep)
+    conn.execute(
+        """
+        UPDATE usuarios
+        SET cep = %s, codigo_ibge_residencia = %s, municipio_residencia = %s,
+            uf_residencia = %s, id_area_residencia = %s, residencia_atualizada_em = now()
+        WHERE id_usuario = %s
+        """,
+        (res["cep"], res["codigo_ibge"], res["municipio"], res["uf"], res["id_area"], u["id_usuario"]),
+    )
+    auditoria.registrar(conn, "residencia_atualizada", u["id_usuario"], "usuarios", u["id_usuario"],
+                        {"codigo_ibge": res["codigo_ibge"], "id_area": res["id_area"]})
+    return conn.execute(
+        f"SELECT {COLUNAS_USUARIO} FROM usuarios WHERE id_usuario = %s", (u["id_usuario"],)
+    ).fetchone()
 
 
 @router.get("/eu", response_model=UsuarioOut)
