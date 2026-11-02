@@ -8,6 +8,7 @@ Cria sql/limite_<nome>.sql. Depois é só aplicar com aplicar_sql.py.
 Se o código não for do município que você digitou, o script avisa e para.
 Não precisa instalar nada além do que o projeto já tem.
 """
+import gzip
 import json
 import os
 import re
@@ -16,7 +17,6 @@ import unicodedata
 import urllib.error
 import urllib.request
 from pathlib import Path
-import gzip
 
 BASE = os.getenv("IBGE_BASE", "https://servicodados.ibge.gov.br/api")
 URL_MALHA = BASE + "/v3/malhas/municipios/{codigo}"
@@ -30,23 +30,13 @@ VARIANTES = [
 
 
 def _pedir(url: str):
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "PavimentAI-script",
-            "Accept-Encoding": "identity"
-        }
-    )
-
+    req = urllib.request.Request(url, headers={"User-Agent": "PavimentAI-script"})
     with urllib.request.urlopen(req, timeout=60) as resposta:
-        conteudo = resposta.read()
-
-        # Verifica se a resposta veio compactada em GZIP
-        if conteudo[:2] == b"\x1f\x8b":
-            conteudo = gzip.decompress(conteudo)
-
-        # Converte a resposta para JSON
-        return json.loads(conteudo.decode("utf-8-sig"))
+        corpo = resposta.read()
+        # O IBGE às vezes responde compactado (gzip): descompacta antes de ler
+        if resposta.headers.get("Content-Encoding", "").lower() == "gzip" or corpo[:2] == b"\x1f\x8b":
+            corpo = gzip.decompress(corpo)
+    return json.loads(corpo.decode("utf-8"))
 
 
 def baixar(codigo: str) -> dict:
@@ -54,7 +44,7 @@ def baixar(codigo: str) -> dict:
     for sufixo in VARIANTES:
         try:
             return _pedir(URL_MALHA.format(codigo=codigo) + sufixo)
-        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as erro:
+        except (OSError, ValueError) as erro:  # inclui falha de rede, gzip ruim e JSON inválido
             ultimo_erro = erro
     raise SystemExit(f"Não consegui baixar do IBGE: {ultimo_erro}\nConfira a internet e o código do município.")
 
@@ -66,7 +56,7 @@ def nome_oficial(codigo: str) -> str | None:
         if isinstance(dados, list):
             dados = dados[0] if dados else {}
         return dados.get("nome")
-    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, AttributeError):
+    except (OSError, ValueError, AttributeError):
         return None
 
 
@@ -126,6 +116,14 @@ FROM public.areas_atendimento a
 WHERE a.codigo_ibge = '{codigo}'
   AND o.id_area IS NULL
   AND ST_DWithin(a.geometria, o.localizacao, {tolerancia_m});
+
+-- Liga a esta área os cidadãos que já tinham informado morar nesta cidade
+UPDATE public.usuarios u
+SET id_area_residencia = a.id_area
+FROM public.areas_atendimento a
+WHERE a.codigo_ibge = '{codigo}'
+  AND u.codigo_ibge_residencia = a.codigo_ibge
+  AND u.id_area_residencia IS NULL;
 """
 
 
