@@ -1,4 +1,6 @@
 import json
+import psycopg.errors
+
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
@@ -6,8 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from .. import auditoria, ibge
 from ..db import get_conn_admin
 from ..deps import exigir_papel
-from ..schemas import AreaAlterarIn, AreaNovaIn, PapelIn
-
+from ..schemas import (
+    AreaAlterarIn,
+    AreaNovaIn,
+    PapelIn,
+    TipoAlterarIn,
+    TipoNovoIn,
+)
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
 SoAdmin = exigir_papel("admin")
@@ -200,3 +207,147 @@ def mudar_papel(id_usuario: IdBigint, dados: PapelIn, u=Depends(SoAdmin), conn=D
     auditoria.registrar(conn, "papel_alterado", u["id_usuario"], "usuarios", id_usuario,
                         {"de": alvo["papel"], "para": dados.papel, "id_area_gestao": dados.id_area_gestao})
     return novo
+
+
+
+TIPOS_BASE = ("buraco", "acessibilidade")
+
+CodigoTipo = Annotated[str, Path(pattern=r"^[a-z][a-z0-9_]{1,19}$")]
+
+COLUNAS_TIPO = "id_tipo, codigo, nome, usa_ia, usa_gravidade, categorias, ativo, ordem"
+
+
+@router.get("/tipos")
+def listar_tipos(u=Depends(SoAdmin), conn=Depends(get_conn_admin)):
+    """Todos os tipos, inclusive desativados, com quantas ocorrências cada um tem."""
+    return conn.execute(
+        f"""
+        SELECT {COLUNAS_TIPO},
+               (SELECT count(*) FROM ocorrencias o WHERE o.tipo = t.codigo) AS ocorrencias
+        FROM tipos_ocorrencia t
+        ORDER BY t.ordem, t.nome
+        """
+    ).fetchall()
+
+
+@router.post("/tipos", status_code=201)
+def criar_tipo(
+    dados: TipoNovoIn,
+    u=Depends(SoAdmin),
+    conn=Depends(get_conn_admin),
+):
+    """Cria um tipo novo. Por enquanto sem IA."""
+
+    try:
+        # A transação interna cria um savepoint. Isso permite tratar
+        # a violação de unicidade sem deixar a transação externa inválida.
+        with conn.transaction():
+            t = conn.execute(
+                f"""
+                INSERT INTO tipos_ocorrencia
+                    (codigo, nome, usa_ia, usa_gravidade, categorias, ordem)
+                VALUES (%s, %s, false, %s, %s, %s)
+                RETURNING {COLUNAS_TIPO}
+                """,
+                (
+                    dados.codigo,
+                    dados.nome,
+                    dados.usa_gravidade,
+                    dados.categorias,
+                    dados.ordem,
+                ),
+            ).fetchone()
+
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, "Já existe um tipo com esse código.")
+
+    auditoria.registrar(
+        conn,
+        "tipo_criado",
+        u["id_usuario"],
+        "tipos_ocorrencia",
+        t["id_tipo"],
+        {"codigo": dados.codigo},
+    )
+
+    return t
+
+
+@router.patch("/tipos/{codigo}")
+def alterar_tipo(
+    codigo: CodigoTipo,
+    dados: TipoAlterarIn,
+    u=Depends(SoAdmin),
+    conn=Depends(get_conn_admin),
+):
+    """Muda nome, ordem, categorias ou ativa/desativa.
+    Não se pode retirar uma categoria em uso nem desativar tipos base.
+    """
+
+    atual = conn.execute(
+        """
+        SELECT id_tipo
+        FROM tipos_ocorrencia
+        WHERE codigo = %s
+        FOR UPDATE
+        """,
+        (codigo,),
+    ).fetchone()
+
+    if atual is None:
+        raise HTTPException(404, "Tipo não encontrado.")
+
+    if dados.ativo is False and codigo in TIPOS_BASE:
+        raise HTTPException(409, "Os tipos base não podem ser desativados.")
+
+    if dados.categorias is not None:
+        em_uso = {
+            l["categoria"]
+            for l in conn.execute(
+                """
+                SELECT DISTINCT categoria
+                FROM ocorrencias
+                WHERE tipo = %s AND categoria IS NOT NULL
+                """,
+                (codigo,),
+            ).fetchall()
+        }
+
+        faltando = em_uso - set(dados.categorias)
+
+        if faltando:
+            raise HTTPException(
+                409,
+                "Estas categorias já têm ocorrências e não podem sair: "
+                + ", ".join(sorted(faltando)),
+            )
+
+    t = conn.execute(
+        f"""
+        UPDATE tipos_ocorrencia
+        SET nome = COALESCE(%s::varchar, nome),
+            ativo = COALESCE(%s::boolean, ativo),
+            ordem = COALESCE(%s::int, ordem),
+            categorias = COALESCE(%s::text[], categorias)
+        WHERE codigo = %s
+        RETURNING {COLUNAS_TIPO}
+        """,
+        (
+            dados.nome,
+            dados.ativo,
+            dados.ordem,
+            dados.categorias,
+            codigo,
+        ),
+    ).fetchone()
+
+    auditoria.registrar(
+        conn,
+        "tipo_alterado",
+        u["id_usuario"],
+        "tipos_ocorrencia",
+        atual["id_tipo"],
+        dados.model_dump(exclude_none=True),
+    )
+
+    return t

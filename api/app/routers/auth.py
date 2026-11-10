@@ -1,5 +1,5 @@
 import hmac
-
+import secrets
 import psycopg.errors
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import OAuth2PasswordRequestForm
@@ -8,7 +8,7 @@ from .. import auditoria, residencia
 from ..config import settings
 from ..db import get_conn
 from ..deps import COLUNAS_USUARIO, usuario_atual
-from ..schemas import CadastroIn, ReenviarIn, ResidenciaIn, TokenOut, UsuarioOut, VerificarEmailIn
+from ..schemas import CadastroIn, ReenviarIn, ResidenciaIn, TokenOut, UsuarioOut, VerificarEmailIn, AtualizarPerfilIn, ConfirmarSenhaIn, TrocarSenhaIn
 from ..seguranca import (
     criar_token,
     gerar_codigo_6_digitos,
@@ -228,6 +228,76 @@ def atualizar_residencia(dados: ResidenciaIn, u=Depends(usuario_atual), conn=Dep
         f"SELECT {COLUNAS_USUARIO} FROM usuarios WHERE id_usuario = %s", (u["id_usuario"],)
     ).fetchone()
 
+def _confirmar_senha(conn, u, senha: str) -> None:
+    """Pede a senha de novo nas ações sensíveis. Erros seguidos travam por um tempo,
+    como no login: um token roubado não serve para adivinhar a senha."""
+    falhas = conn.execute(
+        """
+        SELECT count(*) AS n FROM auditoria
+        WHERE id_usuario = %s AND acao = 'senha_confirmacao_falha'
+          AND criado_em > now() - make_interval(mins => %s)
+        """,
+        (u["id_usuario"], settings.bloqueio_login_min),
+    ).fetchone()["n"]
+    if falhas >= settings.max_falhas_login:
+        raise HTTPException(
+            429, f"Muitas tentativas erradas. Tente de novo em {settings.bloqueio_login_min} minutos.")
+    atual = conn.execute(
+        "SELECT hash_senha FROM usuarios WHERE id_usuario = %s", (u["id_usuario"],)
+    ).fetchone()
+    if not verificar_senha(senha, atual["hash_senha"]):
+        auditoria.registrar(conn, "senha_confirmacao_falha", u["id_usuario"], "usuarios", u["id_usuario"])
+        conn.commit()  # grava a falha mesmo devolvendo erro
+        raise HTTPException(403, "Senha incorreta")
+
+
+@router.patch("/me", response_model=UsuarioOut)
+def atualizar_perfil(dados: AtualizarPerfilIn, u=Depends(usuario_atual), conn=Depends(get_conn)):
+    """Troca nome e/ou telefone. O e-mail ainda não muda por aqui (exigiria confirmar o novo)."""
+    if dados.telefone is not None and dados.telefone != u["telefone"] and u["telefone_verificado"]:
+        raise HTTPException(409, "Telefone já verificado: a troca ainda não está disponível.")
+    try:
+        conn.execute(
+            """
+            UPDATE usuarios
+            SET nome = COALESCE(%s::varchar, nome), telefone = COALESCE(%s::varchar, telefone)
+            WHERE id_usuario = %s
+            """,
+            (dados.nome, dados.telefone, u["id_usuario"]),
+        )
+    except psycopg.errors.UniqueViolation:
+        raise HTTPException(409, "Este telefone já está cadastrado em outra conta.")
+    auditoria.registrar(conn, "perfil_atualizado", u["id_usuario"], "usuarios", u["id_usuario"],
+                        {"campos": [k for k, v in dados.model_dump().items() if v is not None]})
+    return conn.execute(
+        f"SELECT {COLUNAS_USUARIO} FROM usuarios WHERE id_usuario = %s", (u["id_usuario"],)
+    ).fetchone()
+
+
+@router.post("/me/senha")
+def trocar_senha(dados: TrocarSenhaIn, u=Depends(usuario_atual), conn=Depends(get_conn)):
+    _confirmar_senha(conn, u, dados.senha_atual)
+    conn.execute(
+        "UPDATE usuarios SET hash_senha = %s WHERE id_usuario = %s",
+        (gerar_hash_senha(dados.senha_nova), u["id_usuario"]),
+    )
+    auditoria.registrar(conn, "senha_alterada", u["id_usuario"], "usuarios", u["id_usuario"])
+    return {"mensagem": "Senha alterada."}
+
+
+@router.delete("/me")
+def excluir_conta(dados: ConfirmarSenhaIn, u=Depends(usuario_atual), conn=Depends(get_conn)):
+    """Encerra a conta apagando os dados pessoais (anonimização). As ocorrências e fotos
+    continuam no mapa, sem identificar a pessoa. Não tem volta."""
+    if u["papel"] != "cidadao":
+        raise HTTPException(403, "Contas de gestor e admin são encerradas pelo admin da plataforma.")
+    _confirmar_senha(conn, u, dados.senha)
+    conn.execute(
+        "SELECT anonimizar_usuario(%s, %s)",
+        (u["id_usuario"], gerar_hash_senha(secrets.token_urlsafe(32))),
+    )
+    auditoria.registrar(conn, "conta_anonimizada", u["id_usuario"], "usuarios", u["id_usuario"])
+    return {"mensagem": "Conta encerrada. Seus dados pessoais foram apagados."}
 
 @router.get("/eu", response_model=UsuarioOut)
 def eu(u=Depends(usuario_atual)):

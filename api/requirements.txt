@@ -7,3 +7,6 @@ python-multipart
 pwdlib[argon2]
 pyjwt
 pillow
+ultralytics
+opencv-python
+

@@ -60,6 +60,50 @@ class ResidenciaIn(BaseModel):
     def validar_cep(cls, v: str) -> str:
         return _cep_so_digitos(v)
 
+class AtualizarPerfilIn(BaseModel):
+    nome: str | None = Field(default=None, min_length=2, max_length=120)
+    telefone: str | None = None
+
+    @field_validator("nome")
+    @classmethod
+    def limpar_nome(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = " ".join(v.split())
+        if len(v) < 2:
+            raise ValueError("nome muito curto")
+        return v
+
+    @field_validator("telefone")
+    @classmethod
+    def so_digitos(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        digitos = re.sub(r"\D", "", v)
+        if not 10 <= len(digitos) <= 13:
+            raise ValueError("telefone inválido (use DDD + número)")
+        return digitos
+
+    @model_validator(mode="after")
+    def pelo_menos_um(self):
+        if self.nome is None and self.telefone is None:
+            raise ValueError("informe o nome ou o telefone")
+        return self
+
+
+class TrocarSenhaIn(BaseModel):
+    senha_atual: str = Field(min_length=1, max_length=128)
+    senha_nova: str = Field(min_length=8, max_length=128)
+
+    @model_validator(mode="after")
+    def diferente(self):
+        if self.senha_nova == self.senha_atual:
+            raise ValueError("a senha nova precisa ser diferente da atual")
+        return self
+
+
+class ConfirmarSenhaIn(BaseModel):
+    senha: str = Field(min_length=1, max_length=128)
 
 class VerificarEmailIn(BaseModel):
     email: EmailStr
@@ -93,10 +137,10 @@ class TokenOut(BaseModel):
 
 # -------------------------------------------------------------- ocorrências
 class OcorrenciaIn(BaseModel):
-    tipo: Tipo
-    categoria: CategoriaAcessibilidade | None = None  # só para acessibilidade
+    tipo: str = Field(pattern=r"^[a-z][a-z0-9_]{1,19}$")
+    categoria: str | None = Field(default=None, max_length=40)
     descricao: str | None = Field(default=None, max_length=1000)
-    gravidade: Gravidade | None = None  # só para buraco (opinião do cidadão)
+    gravidade: Gravidade | None = None  # só para tipos que usam gravidade
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
     # Se já existe uma ocorrência por perto, a API avisa (409).
@@ -111,16 +155,9 @@ class OcorrenciaIn(BaseModel):
         return v.strip() or None
 
     @model_validator(mode="after")
-    def regras_do_tipo(self):
+    def local_valido(self):
         if self.latitude == 0 and self.longitude == 0:
             raise ValueError("localização inválida (0, 0)")
-        if self.tipo == "buraco" and self.categoria is not None:
-            raise ValueError("buraco não tem categoria")
-        if self.tipo == "acessibilidade":
-            if self.categoria is None:
-                raise ValueError("informe a categoria do problema de acessibilidade")
-            if self.gravidade is not None:
-                raise ValueError("gravidade só se aplica a buracos")
         return self
 
 
@@ -196,6 +233,24 @@ class SinalizacaoIn(BaseModel):
 class AnaliseIn(BaseModel):
     resultado: Literal["aceita", "rejeitada"]
 
+class TriagemIn(BaseModel):
+    decisao: Literal["aprovada", "recusada"]
+    motivo: str | None = Field(default=None, max_length=1000)
+    gravidade_verificada: Gravidade | None = None  # só ao aprovar
+
+    @field_validator("motivo")
+    @classmethod
+    def limpar_motivo(cls, v: str | None) -> str | None:
+        return (v.strip() or None) if v is not None else None
+
+    @model_validator(mode="after")
+    def regras(self):
+        if self.decisao == "recusada":
+            if not self.motivo or len(self.motivo) < 5:
+                raise ValueError("explique o motivo da recusa (mínimo de 5 letras)")
+            if self.gravidade_verificada is not None:
+                raise ValueError("gravidade só vale ao aprovar")
+        return self
 
 # -------------------------------------------------------------------- admin
 class AreaNovaIn(BaseModel):
@@ -225,4 +280,49 @@ class PapelIn(BaseModel):
             raise ValueError("para gestor, informe o id_area_gestao (a cidade que ele administra)")
         if self.papel != "gestor" and self.id_area_gestao is not None:
             raise ValueError("id_area_gestao só vale para gestor")
+        return self
+
+# ------------------------------------------------------------ catálogo de tipos
+_CAT = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+
+
+def _checar_categorias(v: list[str] | None) -> list[str] | None:
+    if v is None:
+        return v
+    if len(set(v)) != len(v):
+        raise ValueError("categorias repetidas")
+    for c in v:
+        if not _CAT.match(c):
+            raise ValueError(f"categoria inválida: {c} (use minúsculas, números e _)")
+    return v
+
+
+class TipoNovoIn(BaseModel):
+    codigo: str = Field(pattern=r"^[a-z][a-z0-9_]{1,19}$", description="Ex.: bueiro (minúsculas, até 20)")
+    nome: str = Field(min_length=2, max_length=60)
+    usa_gravidade: bool = False
+    categorias: list[str] = Field(default_factory=list, max_length=30)
+    ordem: int = Field(default=100, ge=0, le=10000)
+
+    @field_validator("categorias")
+    @classmethod
+    def validar_categorias(cls, v):
+        return _checar_categorias(v)
+
+
+class TipoAlterarIn(BaseModel):
+    nome: str | None = Field(default=None, min_length=2, max_length=60)
+    ativo: bool | None = None
+    ordem: int | None = Field(default=None, ge=0, le=10000)
+    categorias: list[str] | None = Field(default=None, max_length=30)
+
+    @field_validator("categorias")
+    @classmethod
+    def validar_categorias(cls, v):
+        return _checar_categorias(v)
+
+    @model_validator(mode="after")
+    def pelo_menos_um(self):
+        if all(x is None for x in (self.nome, self.ativo, self.ordem, self.categorias)):
+            raise ValueError("informe pelo menos um campo para alterar")
         return self

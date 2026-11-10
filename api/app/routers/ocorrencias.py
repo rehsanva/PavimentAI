@@ -22,6 +22,26 @@ COLUNAS = """
 MAX_GRAUS_MAPA = 10  # tamanho máximo da área pedida no mapa (em graus)
 
 
+def _checar_tipo(conn, dados) -> None:
+    """Valida tipo, categoria e gravidade contra o catálogo (e dá mensagem clara)."""
+    t = conn.execute(
+        "SELECT nome, usa_gravidade, categorias, ativo FROM tipos_ocorrencia WHERE codigo = %s",
+        (dados.tipo,),
+    ).fetchone()
+    if t is None or not t["ativo"]:
+        raise HTTPException(422, "Tipo de ocorrência inválido ou desativado.")
+    if t["categorias"]:
+        if dados.categoria is None:
+            raise HTTPException(422, f"Informe a categoria. Opções: {', '.join(t['categorias'])}")
+        if dados.categoria not in t["categorias"]:
+            raise HTTPException(
+                422, f"Categoria inválida para {t['nome']}. Opções: {', '.join(t['categorias'])}")
+    elif dados.categoria is not None:
+        raise HTTPException(422, f"{t['nome']} não tem categoria.")
+    if dados.gravidade is not None and not t["usa_gravidade"]:
+        raise HTTPException(422, f"Gravidade não se aplica a {t['nome']}.")
+
+
 def _checar_area_de_atendimento(conn, lat: float, lon: float) -> tuple[int | None, bool]:
     """Cerca geográfica: só aceita ocorrência dentro de uma área de atendimento ativa
     (com uma folguinha na divisa por causa do erro do GPS).
@@ -75,6 +95,8 @@ def _checar_quem_pode_registrar(u, id_area: int | None, exige_residencia: bool) 
 @router.post("", response_model=OcorrenciaOut, status_code=201)
 def criar(dados: OcorrenciaIn, u=Depends(usuario_atual), conn=Depends(get_conn)):
     """Registra uma ocorrência. Se já houver uma aberta por perto, avisa (409)."""
+    _checar_tipo(conn, dados)
+
     # 1) Freio contra spam: limite de registros por hora
     n = conn.execute(
         """
@@ -171,12 +193,18 @@ def mapa(
     lat_max: Annotated[float, Query(ge=-90, le=90)],
     lon_min: Annotated[float, Query(ge=-180, le=180)],
     lon_max: Annotated[float, Query(ge=-180, le=180)],
-    tipo: Literal["buraco", "acessibilidade"] | None = None,
+    tipo: Annotated[str | None, Query(pattern=r"^[a-z][a-z0-9_]{1,19}$")] = None,
     id_area: Annotated[int | None, Query(ge=1, description="Só ocorrências desta cidade/área")] = None,
+    verificacao: Annotated[
+        Literal["verificadas", "todas"],
+        Query(description="verificadas = só o que a IA confirmou ou o gestor aprovou; "
+                          "todas = inclui as que ainda estão em triagem ou sem foto"),
+    ] = "verificadas",
     limite: Annotated[int, Query(ge=1, le=2000)] = 500,
     conn=Depends(get_conn),
 ):
-    """Ocorrências abertas dentro de uma área, em GeoJSON (pronto para Leaflet/Mapbox)."""
+    """Ocorrências abertas dentro de uma área, em GeoJSON (pronto para Leaflet/Mapbox).
+    Por padrão mostra só as verificadas. Recusadas na triagem nunca aparecem."""
     if lat_min >= lat_max or lon_min >= lon_max:
         raise HTTPException(422, "A área precisa ter lat_min < lat_max e lon_min < lon_max")
     if lat_max - lat_min > MAX_GRAUS_MAPA or lon_max - lon_min > MAX_GRAUS_MAPA:
@@ -184,20 +212,32 @@ def mapa(
 
     linhas = conn.execute(
         """
-        SELECT id_ocorrencia, tipo, categoria, gravidade, status, canal_registro,
-               confianca_max, criado_em, latitude, longitude, id_area
-        FROM vw_mapa_ocorrencias
+        SELECT v.id_ocorrencia, v.tipo, v.categoria, v.gravidade, v.status, v.canal_registro,
+               v.confianca_max, v.criado_em, v.latitude, v.longitude, v.id_area,
+               CASE WHEN o.triagem_decisao = 'aprovada' THEN 'aprovada_gestor'
+                    WHEN o.situacao_ia = 'confirmada'   THEN 'confirmada_ia'
+                    WHEN o.situacao_ia = 'triagem'      THEN 'em_triagem'
+                    WHEN NOT t.usa_ia                   THEN 'sem_ia'
+                    ELSE 'sem_foto' END AS verificacao
+        FROM vw_mapa_ocorrencias v
+        JOIN ocorrencias o ON o.id_ocorrencia = v.id_ocorrencia
+        JOIN tipos_ocorrencia t ON t.codigo = v.tipo
         WHERE ST_Intersects(
-                  localizacao,
+                  v.localizacao,
                   ST_MakeEnvelope(%(lon_min)s::float8, %(lat_min)s::float8,
                                   %(lon_max)s::float8, %(lat_max)s::float8, 4326)::geography)
-          AND (%(tipo)s::text IS NULL OR tipo = %(tipo)s::text)
-          AND (%(id_area)s::int IS NULL OR id_area = %(id_area)s::int)
-        ORDER BY criado_em DESC
+          AND (%(tipo)s::text IS NULL OR v.tipo = %(tipo)s::text)
+          AND (%(id_area)s::int IS NULL OR v.id_area = %(id_area)s::int)
+          AND o.triagem_decisao IS DISTINCT FROM 'recusada'
+          AND (%(verif)s::text = 'todas'
+               OR NOT t.usa_ia
+               OR o.situacao_ia = 'confirmada'
+               OR o.triagem_decisao = 'aprovada')
+        ORDER BY v.criado_em DESC
         LIMIT %(limite)s
         """,
-        {"lat_min": lat_min, "lat_max": lat_max, "lon_min": lon_min,
-         "lon_max": lon_max, "tipo": tipo, "id_area": id_area, "limite": limite},
+        {"lat_min": lat_min, "lat_max": lat_max, "lon_min": lon_min, "lon_max": lon_max,
+         "tipo": tipo, "id_area": id_area, "verif": verificacao, "limite": limite},
     ).fetchall()
 
     return {
@@ -216,6 +256,7 @@ def mapa(
                     "status": r["status"],
                     "canal_registro": r["canal_registro"],
                     "confianca_ia": r["confianca_max"],
+                    "verificacao": r["verificacao"],
                     "criado_em": r["criado_em"],
                 },
             }
@@ -243,7 +284,18 @@ def minhas(
     ).fetchall()
 
 
-# Esta rota fica por último: "/{id}" aceitaria qualquer coisa, inclusive "mapa" e "minhas"
+@router.get("/tipos")
+def listar_tipos(conn=Depends(get_conn)):
+    """Tipos de ocorrência ativos, com as categorias de cada um (para o app montar o formulário)."""
+    return conn.execute(
+        """
+        SELECT codigo, nome, usa_gravidade, categorias
+        FROM tipos_ocorrencia WHERE ativo ORDER BY ordem, nome
+        """
+    ).fetchall()
+
+
+# Esta rota fica por último: "/{id}" aceitaria qualquer coisa, inclusive "mapa", "minhas" e "tipos"
 @router.get("/{id_ocorrencia}", response_model=OcorrenciaOut)
 def obter(id_ocorrencia: Annotated[int, Path(ge=1, le=2**63 - 1)], conn=Depends(get_conn)):
     o = conn.execute(

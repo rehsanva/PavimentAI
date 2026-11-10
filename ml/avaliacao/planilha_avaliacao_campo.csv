@@ -1,0 +1,3 @@
+\xef\xbb\xbfvideo;trecho;distancia_km;condicao (sol/sombra/molhado);buracos_reais_visiveis;acertos;perdidos;falsos_alarmes;o_que_enganou_o_modelo (bueiro, remendo, sombra...);conf_usada
+rua1.mp4;Rua A;0,5;sol forte;;;;;;0,25
+rua1.mp4;Rua B;0,3;sombra;;;;;;0,25
