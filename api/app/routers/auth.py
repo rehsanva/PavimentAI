@@ -160,6 +160,23 @@ def login(form: OAuth2PasswordRequestForm = Depends(), conn=Depends(get_conn)):
         (form.username,),
     ).fetchone()
 
+    # Freio contra adivinhar senha: muitas senhas erradas seguidas travam a conta por um tempo
+    if u:
+        falhas = conn.execute(
+            """
+            SELECT count(*) AS n FROM auditoria f
+            WHERE f.id_usuario = %(u)s AND f.acao = 'login_falha'
+              AND f.criado_em > now() - make_interval(mins => %(min)s)
+              AND f.criado_em > coalesce(
+                    (SELECT max(l.criado_em) FROM auditoria l
+                      WHERE l.id_usuario = %(u)s AND l.acao = 'login'), '-infinity'::timestamptz)
+            """,
+            {"u": u["id_usuario"], "min": settings.bloqueio_login_min},
+        ).fetchone()["n"]
+        if falhas >= settings.max_falhas_login:
+            raise HTTPException(
+                429, f"Muitas tentativas erradas. Tente de novo em {settings.bloqueio_login_min} minutos.")
+
     if not verificar_senha(form.password, u["hash_senha"] if u else None):
         if u:
             auditoria.registrar(conn, "login_falha", u["id_usuario"], "usuarios", u["id_usuario"])

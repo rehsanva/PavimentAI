@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
+from .config import settings
 from .db import get_conn, pool, pool_admin
 from .routers import admin, areas, auth, cep, fotos, gestao, ocorrencias, sinalizacoes
 
@@ -17,7 +20,15 @@ async def lifespan(app: FastAPI):
         pool_admin.close()
 
 
-app = FastAPI(title="PavimentAI API", version="0.8.0", lifespan=lifespan)
+app = FastAPI(title="PavimentAI API", version="0.9.0", lifespan=lifespan)
+# Deixa o front (HTML/JS em outro endereço) chamar a API pelo navegador
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in settings.cors_origens.split(",") if o.strip()],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(auth.router)
 app.include_router(areas.router)
 app.include_router(cep.router)
@@ -39,3 +50,8 @@ def saude(conn=Depends(get_conn)):
         """
     ).fetchone()
     return {"status": "ok", **row}
+
+
+# O front vai por último, para nunca esconder uma rota da API
+if settings.web_dir.is_dir():
+    app.mount("/web", StaticFiles(directory=settings.web_dir, html=True), name="web")

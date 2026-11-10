@@ -24,6 +24,20 @@ class Settings(BaseSettings):
     # Cerca geográfica: tolerância (erro do GPS perto da divisa do município)
     tolerancia_area_m: int = 30
 
+    # Front-end: endereços de sites que podem chamar a API pelo navegador (CORS),
+    # separados por vírgula. O endereço do seu site publicado entra aqui (CORS_ORIGENS no .env).
+    cors_origens: str = (
+        "http://localhost:5500,http://127.0.0.1:5500,http://localhost:3000,http://127.0.0.1:3000,"
+        "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8080,http://127.0.0.1:8080"
+    )
+    # Se esta pasta existir, a API também entrega o front em /web (mesmo endereço da API,
+    # então não precisa de CORS e a câmera funciona em localhost). Padrão: a pasta web do projeto.
+    web_dir: Path = Path(__file__).resolve().parents[2] / "web"
+
+    # Proteção do login: depois de X senhas erradas seguidas, a conta espera um tempo
+    max_falhas_login: int = 5
+    bloqueio_login_min: int = 15
+
     # Conexão separada, só do painel de admin (cadastrar cidades e mudar papéis).
     # Criada com: python scripts/criar_papel_admin_db.py  (veja as instruções)
     db_admin_user: str | None = None
