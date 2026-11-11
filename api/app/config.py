@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     # Pasta onde as fotos ficam guardadas (por padrão: api/uploads).
     # Na hospedagem, aponte para um disco/volume persistente com UPLOADS_DIR no .env.
     uploads_dir: Path = Path(__file__).resolve().parents[1] / "uploads"
+        # E-mail (opcional). Sem SMTP_HOST nenhum e-mail é enviado de verdade:
+    # em desenvolvimento o código só aparece no terminal da API.
+    smtp_host: str | None = None
+    smtp_porta: int = 587
+    smtp_usuario: str | None = None
+    smtp_senha: str | None = None
+    smtp_remetente: str | None = None
 
 
 settings = Settings()

@@ -82,14 +82,9 @@ def _checar_quem_pode_registrar(u, id_area: int | None, exige_residencia: bool) 
             raise HTTPException(403, {"codigo": "outro_municipio",
                                       "mensagem": "Você administra outro município."})
         return
-    # Cidadão: precisa ter informado onde mora ...
-    if not u["residencia_informada"]:
-        raise HTTPException(403, {"codigo": "residencia_pendente",
-                                  "mensagem": "Informe o seu CEP (PUT /auth/residencia) antes de registrar ocorrências."})
-    # ... e, nos municípios que exigem morador, a residência tem que ser a mesma da ocorrência
-    if exige_residencia and u["id_area_residencia"] != id_area:
-        raise HTTPException(403, {"codigo": "fora_da_residencia",
-                                  "mensagem": "Neste município só moradores podem registrar ocorrências."})
+    # Cidadão: qualquer conta ativa pode registrar, desde que o local esteja dentro
+    # da área de atendimento (já checado em _checar_area_de_atendimento).
+    # Não exige mais CEP nem residência.
 
 
 @router.post("", response_model=OcorrenciaOut, status_code=201)

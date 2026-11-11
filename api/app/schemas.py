@@ -1,4 +1,6 @@
 import re
+
+from fastapi import APIRouter
 from datetime import datetime
 from typing import Literal
 
@@ -28,12 +30,7 @@ class CadastroIn(BaseModel):
     email: EmailStr
     telefone: str
     senha: str = Field(min_length=8, max_length=128)
-    cep: str  # só para descobrir o município onde a pessoa mora (o número da casa não é guardado)
 
-    @field_validator("cep")
-    @classmethod
-    def validar_cep(cls, v: str) -> str:
-        return _cep_so_digitos(v)
 
     @field_validator("nome")
     @classmethod
@@ -326,3 +323,35 @@ class TipoAlterarIn(BaseModel):
         if all(x is None for x in (self.nome, self.ativo, self.ordem, self.categorias)):
             raise ValueError("informe pelo menos um campo para alterar")
         return self
+    
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _normalizar_email(v: str) -> str:
+    v = v.strip().lower()
+    if not _EMAIL_RE.match(v):
+        raise ValueError("e-mail inválido")
+    return v
+
+
+class EsqueciSenhaIn(BaseModel):
+    email: str = Field(max_length=254)
+
+    @field_validator("email")
+    @classmethod
+    def email_valido(cls, v: str) -> str:
+        return _normalizar_email(v)
+
+
+class RedefinirSenhaIn(BaseModel):
+    email: str = Field(max_length=254)
+    codigo: str = Field(pattern=r"^\d{6}$", description="Código de 6 dígitos recebido por e-mail")
+    senha_nova: str = Field(min_length=8, max_length=128)
+
+    @field_validator("email")
+    @classmethod
+    def email_valido(cls, v: str) -> str:
+        return _normalizar_email(v)
+    
+    
